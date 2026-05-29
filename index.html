@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>Wind Meadow — Procedural Grass Shader</title>
+<style>
+  :root{
+    --ink:#f2f6e9;
+    --muted:#bcc89a;
+    --panel:rgba(18,24,10,0.72);
+    --hair:rgba(190,220,120,0.18);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:#1a1408;color:var(--ink);
+    font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+  #app{position:fixed;inset:0}
+  canvas{display:block}
+
+  .hud{position:fixed;left:22px;top:20px;z-index:5;pointer-events:none;
+    max-width:340px;mix-blend-mode:screen}
+  .hud .eyebrow{font-size:10.5px;letter-spacing:.42em;text-transform:uppercase;
+    color:var(--muted);margin:0 0 6px}
+  .hud h1{font-family:Georgia,"Times New Roman",serif;font-weight:400;font-style:italic;
+    font-size:30px;line-height:1.02;margin:0;letter-spacing:.2px;
+    text-shadow:0 2px 30px rgba(40,30,0,.6)}
+  .hud h1 b{font-style:normal;font-weight:600}
+  .hud .sub{margin:12px 0 0;font-size:11px;line-height:1.6;color:var(--muted);
+    max-width:300px}
+  .legend{position:fixed;left:22px;bottom:18px;z-index:5;font-size:10.5px;
+    letter-spacing:.16em;color:var(--muted);text-transform:uppercase}
+  .legend span{display:inline-block;width:9px;height:9px;border-radius:2px;
+    margin:0 5px 0 16px;transform:translateY(1px)}
+  .legend span:first-of-type{margin-left:0}
+  #fps{position:fixed;right:18px;bottom:16px;z-index:5;font-size:10.5px;
+    letter-spacing:.14em;color:var(--muted)}
+  .lil-gui{--background-color:var(--panel);--widget-color:rgba(30,40,16,.9);
+    --focus-color:#9bd34a;--font-size:11px;--title-background-color:rgba(14,20,6,.9);
+    backdrop-filter:blur(9px);border:1px solid var(--hair)}
+  .loader{position:fixed;inset:0;z-index:9;display:flex;align-items:center;
+    justify-content:center;background:#1a1408;letter-spacing:.3em;font-size:11px;
+    color:var(--muted);text-transform:uppercase;transition:opacity .6s}
+</style>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.161.0/examples/jsm/",
+    "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.2/dist/lil-gui.esm.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app"></div>
+
+<div class="hud">
+  <p class="eyebrow">Real-time / WebGL2</p>
+  <h1>Wind <b>Meadow</b><br>Procedural Grass Shader</h1>
+  <p class="sub">One animated wind field drives every blade: the bend, the gust
+     shadows sweeping the field, the color, and the backlit glow when the low sun
+     shines through. Instanced geometry — no textures.</p>
+</div>
+
+<div class="legend">
+  Wind field
+  <span style="background:#3a5a1e"></span>shadowed
+  <span style="background:#8fbf3e"></span>lit
+  <span style="background:#d8e85a"></span>backlit tip
+</div>
+<div id="fps">— fps</div>
+<div class="loader" id="loader">growing the meadow…</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import GUI from 'lil-gui';
+
+/* ============================================================================
+   SHARED GLSL  ───────────────────────────────────────────────────────────────
+   Same noise toolkit as the coastline scene (hash / value noise / FBM / simplex)
+   plus the two analytic fields every material in THIS scene reads:
+     terrainHeight(p) — the gentle rolling ground, so blades + ground agree
+     windAt(p)        — the single scrolling gust field that drives the bend,
+                        the gust shadows on the ground, and the color shading.
+   Sharing windAt() is what makes the motion read as one coherent breeze instead
+   of each blade twitching independently.
+   ========================================================================== */
+const COMMON_UNIFORMS = /* glsl */`
+  uniform float uTime;
+  uniform float uSeed;
+  uniform float uHills;       // ground undulation amplitude
+  uniform float uWindAngle;   // radians, primary wind direction
+  uniform float uWindSpeed;   // how fast gust fronts travel
+  uniform float uWindScale;   // spatial frequency of gusts
+`;
+
+const COMMON_GLSL = /* glsl */`
+  float hash21(vec2 p){
+    p = fract(p*vec2(127.1,311.7));
+    p += dot(p, p+34.23);
+    return fract(p.x*p.y);
+  }
+  float vnoise(vec2 p){
+    vec2 i = floor(p), f = fract(p);
+    float a = hash21(i);
+    float b = hash21(i+vec2(1.0,0.0));
+    float c = hash21(i+vec2(0.0,1.0));
+    float d = hash21(i+vec2(1.0,1.0));
+    vec2 u = f*f*f*(f*(f*6.0-15.0)+10.0);
+    return mix(mix(a,b,u.x), mix(c,d,u.x), u.y);
+  }
+  float fbm(vec2 p){
+    float v=0.0, a=0.5;
+    mat2 m = mat2(1.6,1.2,-1.2,1.6);
+    for(int i=0;i<5;i++){ v += a*vnoise(p); p = m*p; a *= 0.5; }
+    return v;
+  }
+
+  // -- SIMPLEX (Ashima/Gustavson) for grid-free gust fronts -----------------
+  vec3 permute3(vec3 x){ return mod(((x*34.0)+1.0)*x, 289.0); }
+  float snoise(vec2 v){
+    const vec4 C = vec4(0.211324865405187, 0.366025403784439,
+                       -0.577350269189626, 0.024390243902439);
+    vec2 i  = floor(v + dot(v, C.yy));
+    vec2 x0 = v - i + dot(i, C.xx);
+    vec2 i1 = (x0.x > x0.y) ? vec2(1.0,0.0) : vec2(0.0,1.0);
+    vec4 x12 = x0.xyxy + C.xxzz; x12.xy -= i1;
+    i = mod(i, 289.0);
+    vec3 p = permute3( permute3( i.y + vec3(0.0, i1.y, 1.0))
+                                + i.x + vec3(0.0, i1.x, 1.0));
+    vec3 m = max(0.5 - vec3(dot(x0,x0), dot(x12.xy,x12.xy),
+                            dot(x12.zw,x12.zw)), 0.0);
+    m = m*m; m = m*m;
+    vec3 x = 2.0*fract(p*C.www) - 1.0;
+    vec3 h = abs(x) - 0.5;
+    vec3 ox = floor(x + 0.5);
+    vec3 a0 = x - ox;
+    m *= 1.79284291400159 - 0.85373472095314*(a0*a0 + h*h);
+    vec3 g;
+    g.x  = a0.x  * x0.x  + h.x  * x0.y;
+    g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+    return 130.0 * dot(m, g);
+  }
+  const mat2 ROT = mat2(0.86, 0.50, -0.50, 0.86) * 1.93;
+  float sfbm(vec2 p){
+    p += vec2(uSeed*31.7, uSeed*-17.3);
+    float v=0.0, a=0.5;
+    for(int i=0;i<4;i++){ v += a*snoise(p); p = ROT*p; a *= 0.5; }
+    return v*0.5 + 0.5;
+  }
+
+  // -- ground: gentle rolling hills ----------------------------------------
+  float terrainHeight(vec2 p){
+    return (fbm(p*0.012) - 0.5) * 2.0 * uHills;
+  }
+
+  // -- THE WIND FIELD: scrolling gust value in ~[0,1] ----------------------
+  // Two layers travelling along the wind direction at different speeds beat
+  // against each other so gust fronts roll across the field rather than pulse.
+  float windAt(vec2 p){
+    vec2 dir = vec2(cos(uWindAngle), sin(uWindAngle));
+    vec2 q1 = p*uWindScale            - dir*(uTime*uWindSpeed);
+    vec2 q2 = p*uWindScale*2.3 + 11.0 - dir*(uTime*uWindSpeed*1.7);
+    float g = sfbm(q1)*0.65 + sfbm(q2)*0.35;
+    return clamp(g, 0.0, 1.0);
+  }
+`;
+
+/* ============================================================================
+   SKY  — sunset gradient + sun bloom, shared by dome and (indirectly) shading
+   ========================================================================== */
+const SKY_GLSL = /* glsl */`
+  uniform vec3 uSunDir;
+  uniform vec3 uSkyHorizon, uSkyZenith;
+  vec3 skyColor(vec3 dir){
+    float h = clamp(dir.y*0.5+0.5, 0.0, 1.0);
+    vec3 col = mix(uSkyHorizon, uSkyZenith, pow(h, 0.62));
+    // warm haze hugging the horizon
+    col = mix(col, vec3(1.0,0.78,0.52), pow(1.0-h, 7.0)*0.55);
+    float s = max(dot(normalize(dir), uSunDir), 0.0);
+    col += vec3(1.0,0.86,0.62) * pow(s, 1600.0) * 7.0;   // disc
+    col += vec3(1.0,0.74,0.45) * pow(s, 9.0)    * 0.30;   // warm glow
+    return col;
+  }
+`;
+
+/* ----------------------------------------------------------------------------
+   Shared uniforms — grass, ground and sky all read from this one object.
+   -------------------------------------------------------------------------- */
+const U = {
+  uTime:        { value: 0 },
+  uSeed:        { value: 3.0 },
+  uHills:       { value: 3.2 },
+  // wind (shared driver)
+  uWindAngle:   { value: -2.5 },
+  uWindSpeed:   { value: 0.9 },
+  uWindScale:   { value: 0.05 },
+  uGustStrength:{ value: 0.9 },
+  uSwayAmp:     { value: 0.16 },
+  uSwaySpeed:   { value: 2.2 },
+  uBaseLean:    { value: 0.12 },
+  // sun + sky (shared)
+  uSunDir:      { value: new THREE.Vector3(0.0, 0.16, -1.0).normalize() },
+  uSkyHorizon:  { value: new THREE.Color('#ffcf86') },
+  uSkyZenith:   { value: new THREE.Color('#3f6fb0') },
+  // grass look
+  uGrassBase:   { value: new THREE.Color('#2c4d18') },
+  uGrassTip:    { value: new THREE.Color('#bcd84a') },
+  uGrassTint:   { value: new THREE.Color('#7a9b2e') },
+  uBacklight:   { value: new THREE.Color('#e6f06a') },
+  // ground
+  uGroundColor: { value: new THREE.Color('#5a4a26') },
+};
+
+/* ============================================================================
+   GRASS SHADER  (instanced blades)
+   ========================================================================== */
+const GRASS_VERT = /* glsl */`
+  precision highp float;
+  ${COMMON_UNIFORMS}
+  uniform float uGustStrength, uSwayAmp, uSwaySpeed, uBaseLean;
+  ${COMMON_GLSL}
+
+  attribute vec2  aOff;     // world XZ of blade root
+  attribute float aYaw;     // facing of the blade width
+  attribute vec2  aScale;   // (width, height)
+  attribute float aTint;    // 0..1 per-blade color variation
+  attribute float aPhase;   // flutter phase offset
+  attribute float aLean;    // per-blade stiffness multiplier
+
+  varying float vT;         // 0 base .. 1 tip
+  varying float vTint;
+  varying float vGust;      // wind value at this blade (for color)
+  varying vec3  vNormal;
+  varying vec3  vWorld;
+
+  void main(){
+    vec2  wp = aOff;
+    float gy = terrainHeight(wp);
+
+    // --- the single wind field decides this blade's bend ---
+    float gust = windAt(wp);
+    vGust = gust;
+    float flutter = sin(uTime*uSwaySpeed + aPhase + wp.x*0.15 + wp.y*0.11);
+    float bend = (uBaseLean + uGustStrength*gust + uSwayAmp*flutter) * aLean;
+
+    // horizontal frames: width along aYaw, bend along the wind (jittered)
+    vec3 rightDir = vec3(cos(aYaw), 0.0, sin(aYaw));
+    float bj = (aTint - 0.5) * 0.5;                       // slight per-blade fan
+    vec3 bendDir = vec3(cos(uWindAngle+bj), 0.0, sin(uWindAngle+bj));
+
+    float t = position.y;                                 // 0..1 up the blade
+    vT = t;
+    vTint = aTint;
+
+    float H = aScale.y, W = aScale.x;
+    float lean = bend * t * t;                            // bend grows toward tip
+    float ct = cos(lean), st = sin(lean);
+
+    // spine of the (bent) blade, then offset sideways for its width
+    vec3 spine = vec3(wp.x, gy, wp.y)
+               + vec3(0.0, ct, 0.0) * (t*H)
+               + bendDir * (st * t * H);
+    vec3 worldPos = spine + rightDir * (position.x * W);
+
+    // analytic normal: perpendicular to (width axis × spine tangent),
+    // then bowed across the width so the blade reads as rounded, not flat
+    vec3 T = normalize(vec3(0.0, ct, 0.0) + bendDir*st);
+    vec3 nrm = normalize(cross(rightDir, T));
+    nrm = normalize(nrm + rightDir * (position.x * 1.6) * 0.35);
+    vNormal = nrm;
+    vWorld  = worldPos;
+
+    gl_Position = projectionMatrix * viewMatrix * vec4(worldPos, 1.0);
+  }
+`;
+
+const GRASS_FRAG = /* glsl */`
+  precision highp float;
+  ${COMMON_UNIFORMS}
+  uniform vec3 uGrassBase, uGrassTip, uGrassTint, uBacklight;
+  ${COMMON_GLSL}
+  ${SKY_GLSL}
+
+  varying float vT;
+  varying float vTint;
+  varying float vGust;
+  varying vec3  vNormal;
+  varying vec3  vWorld;
+
+  void main(){
+    vec3 V = normalize(cameraPosition - vWorld);
+    vec3 N = normalize(vNormal);
+    if(dot(N,V) < 0.0) N = -N;                  // two-sided: face the camera
+    vec3 L = normalize(uSunDir);
+
+    // -- color: base->tip gradient, shifted per blade, AO darkening at root --
+    vec3 col = mix(uGrassBase, uGrassTip, smoothstep(0.0,1.0,vT));
+    col = mix(col, uGrassTint, (vTint-0.5)*0.6 + 0.15);
+    float ao = mix(0.45, 1.0, vT);              // shadow down in the canopy
+    col *= ao;
+
+    // gust shadow: the same wind field darkens blades inside a gust front,
+    // so the rolling shadow on the ground continues up through the grass
+    col *= mix(0.72, 1.06, vGust);
+
+    // -- soft half-Lambert sun --
+    float diff = dot(N, L)*0.5 + 0.5;
+    col *= 0.45 + 0.85*diff;
+
+    // -- BACKLIT SUBSURFACE GLOW (the hero effect) --
+    // when the low sun is on the far side of a thin blade it lights up;
+    // strongest near the tip and when we're looking toward the sun
+    float back = pow(clamp(dot(V, -L), 0.0, 1.0), 3.0);
+    float thin = mix(0.15, 1.0, vT);
+    col += uBacklight * back * thin * 1.35;
+
+    // -- crisp tip sheen --
+    vec3 Hh = normalize(V + L);
+    col += vec3(1.0,0.98,0.8) * pow(max(dot(N,Hh),0.0), 22.0) * vT * 0.30;
+
+    // -- sky ambient fill --
+    col += uGrassBase * skyColor(N) * 0.12;
+
+    // -- distance haze into the sky --
+    float fogD = length(cameraPosition - vWorld);
+    float fog = 1.0 - exp(-fogD*0.0042);
+    col = mix(col, skyColor(normalize(vWorld-cameraPosition)), fog*0.85);
+
+    gl_FragColor = vec4(col, 1.0);
+  }
+`;
+
+/* ============================================================================
+   GROUND SHADER  (rolling earth under the grass)
+   ========================================================================== */
+const GROUND_VERT = /* glsl */`
+  precision highp float;
+  ${COMMON_UNIFORMS}
+  ${COMMON_GLSL}
+  varying vec3 vWorld;
+  varying vec2 vFlat;
+  void main(){
+    vec4 wp = modelMatrix * vec4(position,1.0);
+    vFlat = wp.xz;
+    wp.y += terrainHeight(wp.xz);
+    vWorld = wp.xyz;
+    gl_Position = projectionMatrix * viewMatrix * wp;
+  }
+`;
+
+const GROUND_FRAG = /* glsl */`
+  precision highp float;
+  ${COMMON_UNIFORMS}
+  uniform vec3 uGroundColor, uGrassBase;
+  ${COMMON_GLSL}
+  ${SKY_GLSL}
+  varying vec3 vWorld;
+  varying vec2 vFlat;
+
+  vec3 groundNormal(vec2 p){
+    float e=0.8;
+    float l=terrainHeight(p-vec2(e,0.0)), r=terrainHeight(p+vec2(e,0.0));
+    float d=terrainHeight(p-vec2(0.0,e)), u=terrainHeight(p+vec2(0.0,e));
+    return normalize(vec3(l-r, 2.0*e, d-u));
+  }
+
+  void main(){
+    vec3 N = groundNormal(vFlat);
+    vec3 L = normalize(uSunDir);
+
+    // earthy base tinted toward grass so gaps between blades aren't bald
+    // ('patch' is a reserved word in GLSL — must use a different name)
+    float tuft = fbm(vFlat*0.4)*0.5 + fbm(vFlat*3.0)*0.2;
+    vec3 col = mix(uGroundColor, uGrassBase*0.7, 0.35 + 0.45*tuft);
+
+    float diff = dot(N,L)*0.5+0.5;
+    col *= 0.6 + 0.8*diff;
+
+    // the wind field's gust shadow sweeping across the meadow floor
+    col *= mix(0.7, 1.05, windAt(vFlat));
+    col += uGroundColor * skyColor(N) * 0.1;
+
+    float fogD = length(cameraPosition - vWorld);
+    float fog = 1.0 - exp(-fogD*0.0042);
+    col = mix(col, skyColor(normalize(vWorld-cameraPosition)), fog*0.85);
+
+    gl_FragColor = vec4(col,1.0);
+  }
+`;
+
+/* ============================================================================
+   JS ── scene assembly
+   ========================================================================== */
+const app = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:'high-performance' });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.75));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth/innerHeight, 0.1, 4000);
+camera.position.set(0, 6, 15);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.target.set(0, 0.0, -5);
+controls.maxPolarAngle = Math.PI*0.52;     // stay near ground level
+controls.minDistance = 3;
+controls.maxDistance = 120;
+
+/* ---- sky dome (reflects the same skyColor the grass samples) ------------ */
+const skyMat = new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite:false,
+  uniforms:{ uSunDir:U.uSunDir, uSkyHorizon:U.uSkyHorizon, uSkyZenith:U.uSkyZenith },
+  vertexShader:/* glsl */`
+    varying vec3 vDir;
+    void main(){ vDir = position; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+  fragmentShader:/* glsl */`
+    precision highp float; varying vec3 vDir; ${SKY_GLSL}
+    void main(){ gl_FragColor = vec4(skyColor(normalize(vDir)), 1.0); }`
+});
+scene.add(new THREE.Mesh(new THREE.SphereGeometry(2000, 32, 16), skyMat));
+
+/* ---- ground -------------------------------------------------------------- */
+const GROUND_SIZE = 800;
+const groundGeo = new THREE.PlaneGeometry(GROUND_SIZE, GROUND_SIZE, 200, 200);
+groundGeo.rotateX(-Math.PI/2);
+const groundMat = new THREE.ShaderMaterial({
+  uniforms: U, vertexShader: GROUND_VERT, fragmentShader: GROUND_FRAG,
+  glslVersion: THREE.GLSL1
+});
+scene.add(new THREE.Mesh(groundGeo, groundMat));
+
+/* ---- one tapered blade, then instanced thousands of times ---------------- */
+function makeBladeGeometry(segments){
+  const rows = segments+1;
+  const pos = [], idx = [];
+  for(let i=0;i<rows;i++){
+    const t = i/segments;
+    const half = 0.5*(1.0 - t)*(1.0 - 0.15*t);   // taper to a point
+    pos.push(-half, t, 0,  half, t, 0);
+  }
+  for(let i=0;i<segments;i++){
+    const a=2*i, b=2*i+1, c=2*i+2, d=2*i+3;
+    idx.push(a,b,c,  c,b,d);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
+  g.setIndex(idx);
+  return g;
+}
+
+const grassMat = new THREE.ShaderMaterial({
+  uniforms: U, vertexShader: GRASS_VERT, fragmentShader: GRASS_FRAG,
+  side: THREE.DoubleSide, glslVersion: THREE.GLSL1
+});
+
+let grassMesh = null;
+const grassParams = { count: 120000, radius: 130, height: 3.4, width: 0.17 };
+
+// JS copy of the value-noise FBM so the CPU scatter can match a density field
+function jsHash(x,y){ let s=Math.sin(x*127.1+y*311.7)*43758.5453; return s-Math.floor(s); }
+function jsVnoise(x,y){
+  const ix=Math.floor(x), iy=Math.floor(y), fx=x-ix, fy=y-iy;
+  const a=jsHash(ix,iy), b=jsHash(ix+1,iy), c=jsHash(ix,iy+1), d=jsHash(ix+1,iy+1);
+  const ux=fx*fx*fx*(fx*(fx*6-15)+10), uy=fy*fy*fy*(fy*(fy*6-15)+10);
+  return (a*(1-ux)+b*ux)*(1-uy)+(c*(1-ux)+d*ux)*uy;
+}
+function jsFbm(x,y){ let v=0,a=0.5; for(let i=0;i<4;i++){ v+=a*jsVnoise(x,y);
+  const nx=1.6*x-1.2*y, ny=1.2*x+1.6*y; x=nx; y=ny; a*=0.5; } return v; }
+
+function buildGrass(){
+  if(grassMesh){ scene.remove(grassMesh); grassMesh.geometry.dispose(); }
+  const blade = makeBladeGeometry(5);
+  const geo = new THREE.InstancedBufferGeometry();
+  geo.index = blade.index;
+  geo.attributes.position = blade.attributes.position;
+  geo.instanceCount = grassParams.count;
+
+  const N = grassParams.count;
+  const off=new Float32Array(N*2), yaw=new Float32Array(N), scl=new Float32Array(N*2);
+  const tint=new Float32Array(N), phase=new Float32Array(N), lean=new Float32Array(N);
+
+  let placed = 0, guard = 0;
+  while(placed < N && guard < N*6){
+    guard++;
+    const r = Math.sqrt(Math.random())*grassParams.radius;
+    const a = Math.random()*Math.PI*2;
+    const x = Math.cos(a)*r, z = Math.sin(a)*r;
+    // tuft density mask: rejection-sample against a noise field so blades
+    // cluster into clumps, but with a floor so nowhere is fully bald
+    const dens = 0.35 + 0.65 * jsFbm(x*0.06, z*0.06);
+    if(Math.random() > dens) continue;
+    const i = placed++;
+    off[i*2]   = x;
+    off[i*2+1] = z;
+    yaw[i] = Math.random()*Math.PI*2;
+    scl[i*2]   = grassParams.width  * (0.7 + Math.random()*0.6);
+    scl[i*2+1] = grassParams.height * (0.6 + Math.random()*0.7);
+    tint[i]  = Math.random();
+    phase[i] = Math.random()*Math.PI*2;
+    lean[i]  = 0.7 + Math.random()*0.6;
+  }
+  geo.instanceCount = placed;
+  geo.setAttribute('aOff',   new THREE.InstancedBufferAttribute(off,2));
+  geo.setAttribute('aYaw',   new THREE.InstancedBufferAttribute(yaw,1));
+  geo.setAttribute('aScale', new THREE.InstancedBufferAttribute(scl,2));
+  geo.setAttribute('aTint',  new THREE.InstancedBufferAttribute(tint,1));
+  geo.setAttribute('aPhase', new THREE.InstancedBufferAttribute(phase,1));
+  geo.setAttribute('aLean',  new THREE.InstancedBufferAttribute(lean,1));
+
+  grassMesh = new THREE.Mesh(geo, grassMat);
+  grassMesh.frustumCulled = false;
+  scene.add(grassMesh);
+}
+buildGrass();
+
+/* ---- floating pollen motes for atmosphere -------------------------------- */
+let pollen=null;
+function buildPollen(count=500){
+  if(pollen){ scene.remove(pollen); pollen.geometry.dispose(); }
+  const p=new Float32Array(count*3);
+  for(let i=0;i<count;i++){
+    p[i*3]=(Math.random()*2-1)*60;
+    p[i*3+1]=Math.random()*9+0.5;
+    p[i*3+2]=(Math.random()*2-1)*60;
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(p,3));
+  const m=new THREE.ShaderMaterial({
+    transparent:true, depthWrite:false, blending:THREE.AdditiveBlending,
+    uniforms:{ uTime:U.uTime, uWindAngle:U.uWindAngle },
+    vertexShader:/* glsl */`
+      precision highp float; uniform float uTime, uWindAngle;
+      void main(){
+        vec3 p = position;
+        vec2 d = vec2(cos(uWindAngle), sin(uWindAngle));
+        p.xz += d * mod(uTime*1.2, 80.0) - d*40.0;       // drift with wind
+        p.x += sin(uTime*0.6 + position.z)*0.7;
+        p.y += sin(uTime*0.4 + position.x)*0.4;
+        vec4 mv = modelViewMatrix * vec4(p,1.0);
+        gl_PointSize = 3.0 * (30.0/-mv.z);
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader:/* glsl */`
+      precision highp float;
+      void main(){
+        float d = length(gl_PointCoord-0.5);
+        if(d>0.5) discard;
+        gl_FragColor = vec4(1.0,0.95,0.7, smoothstep(0.5,0.0,d)*0.5);
+      }`
+  });
+  pollen=new THREE.Points(g,m);
+  pollen.frustumCulled=false;
+  scene.add(pollen);
+}
+buildPollen();
+
+/* ============================================================================
+   GUI
+   ========================================================================== */
+const gui = new GUI({ title:'WIND MEADOW · TUNE' });
+
+const sunState = { azimuth: 200, elevation: 9 };
+function applySun(){
+  const az=THREE.MathUtils.degToRad(sunState.azimuth);
+  const el=THREE.MathUtils.degToRad(sunState.elevation);
+  U.uSunDir.value.set(Math.cos(el)*Math.cos(az), Math.sin(el), Math.cos(el)*Math.sin(az)).normalize();
+}
+applySun();
+
+const fWind = gui.addFolder('Wind');
+const windDeg = { dir: THREE.MathUtils.radToDeg(U.uWindAngle.value) };
+fWind.add(windDeg,'dir',-180,180,1).name('direction')
+  .onChange(v=>U.uWindAngle.value = THREE.MathUtils.degToRad(v));
+fWind.add(U.uWindSpeed,'value',0,3,0.01).name('gust speed');
+fWind.add(U.uWindScale,'value',0.01,0.18,0.001).name('gust scale');
+fWind.add(U.uGustStrength,'value',0,2,0.01).name('gust strength');
+fWind.add(U.uBaseLean,'value',0,0.8,0.01).name('resting lean');
+fWind.add(U.uSwayAmp,'value',0,0.6,0.01).name('flutter amount');
+fWind.add(U.uSwaySpeed,'value',0,6,0.01).name('flutter speed');
+
+const fGrass = gui.addFolder('Grass');
+const reb = ()=>buildGrass();
+fGrass.add(grassParams,'count',5000,160000,1000).name('blade count').onFinishChange(reb);
+fGrass.add(grassParams,'radius',40,200,1).name('field radius').onFinishChange(reb);
+fGrass.add(grassParams,'height',1,7,0.1).name('blade height').onFinishChange(reb);
+fGrass.add(grassParams,'width',0.06,0.4,0.005).name('blade width').onFinishChange(reb);
+fGrass.add(U.uHills,'value',0,10,0.1).name('ground roll');
+const seedCtl = fGrass.add(U.uSeed,'value',0,100,0.01).name('wind seed');
+fGrass.add({ randomize(){ U.uSeed.value=Math.random()*100; seedCtl.updateDisplay(); reb(); } },
+  'randomize').name('🎲 randomize');
+
+const fColor = gui.addFolder('Colors');
+const cc=(u)=>({get color(){return '#'+u.value.getHexString();},
+                set color(v){u.value.set(v);}});
+fColor.addColor(cc(U.uGrassBase),'color').name('blade base');
+fColor.addColor(cc(U.uGrassTip),'color').name('blade tip');
+fColor.addColor(cc(U.uGrassTint),'color').name('blade tint');
+fColor.addColor(cc(U.uBacklight),'color').name('backlight glow');
+fColor.addColor(cc(U.uGroundColor),'color').name('ground');
+fColor.addColor(cc(U.uSkyHorizon),'color').name('sky horizon');
+fColor.addColor(cc(U.uSkyZenith),'color').name('sky zenith');
+fColor.close();
+
+const fSun = gui.addFolder('Sun & Render');
+fSun.add(sunState,'azimuth',0,360,1).name('sun azimuth').onChange(applySun);
+fSun.add(sunState,'elevation',1,80,1).name('sun elevation').onChange(applySun);
+fSun.add(renderer,'toneMappingExposure',0.4,2,0.01).name('exposure');
+fSun.add({ pollen:true },'pollen').name('show pollen')
+  .onChange(v=>{ if(pollen) pollen.visible=v; });
+
+/* ============================================================================
+   RESIZE + RENDER LOOP
+   ========================================================================== */
+addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+const clock = new THREE.Clock();
+const fpsEl = document.getElementById('fps');
+let frames=0, acc=0;
+function loop(){
+  const dt = clock.getDelta();
+  U.uTime.value += dt;
+  controls.update();
+  renderer.render(scene, camera);
+  acc+=dt; frames++;
+  if(acc>0.5){ fpsEl.textContent = Math.round(frames/acc)+' fps'; frames=0; acc=0; }
+  requestAnimationFrame(loop);
+}
+const loader = document.getElementById('loader');
+loader.style.opacity = '0';
+setTimeout(()=>loader.remove(), 700);
+loop();
+</script>
+</body>
+</html>
